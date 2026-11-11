@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "cornerstone.hq",
+  "name": "Cornerstone HQ",
+  "version": "1.0.0",
+  "author": "Kush Beaver Productionz",
+  "license": "MIT",
+  "description": "Cornerstone HQ in the bar: open or bring back the one HQ window, hide or close it, and watch or restart the HQ background services.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Cornerstone HQ",
+    "description": "Open / hide / close HQ and see its services.",
+    "category": "Status",
+    "aliases": [
+      "hq",
+      "cornerstone-hq"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {}
+  }
+}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prints one JSON object: HQ window count and each service's state.
 set -u
-win=$(app-summon --count '^(brave|chrome)-127\.0\.0\.1__-Default$' 2>/dev/null || echo 0)
+win=$(app-summon --count '^(brave|chrome)-127\.0\.0\.1__-Default$' 2>/dev/null | head -n 1 || true)
+[[ ${win:-} =~ ^[0-9]+$ ]] || win=0
 units=(kbp-server:Server hq-bridge:Bridge kbp-bot:"Discord bot" streambot:Streambot lavalink:Lavalink yt-cipher:"YouTube decoder")
 printf '{"windows":%d,"services":[' "${win:-0}"
 first=1

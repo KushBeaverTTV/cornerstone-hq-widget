@@ -1,10 +1,10 @@
 import QtQuick
-import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
 // Cornerstone HQ in the bar (the Linux stand-in for the Windows tray icon).
+// Built once per monitor; state polling and IPC live in Service.qml.
 // Left click: panel. Right click: open / bring back HQ. Middle click: hide it.
 Panel {
   id: root
@@ -12,65 +12,94 @@ Panel {
   ipcTarget: "cornerstone-hq"
   manageIpc: false
 
-  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/cornerstone.hq"
+  readonly property var service: bar && bar.shell ? bar.shell.serviceFor("cornerstone.hq") : null
   readonly property string iconPath: Qt.resolvedUrl("assets/hq.png")
-  readonly property string pattern: "^(brave|chrome)-127\\.0\\.0\\.1__-Default$"
 
-  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color muted: Qt.darker(foreground, 1.55)
   readonly property color hairline: Qt.darker(foreground, 2.4)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color okColor: "#3FB950"
-  readonly property color badColor: "#E11414"
-  readonly property color warnColor: "#FFD400"
 
-  property int windows: 0
-  property var services: []
-  readonly property int downCount: {
-    var n = 0
-    for (var i = 0; i < services.length; i++) if (services[i].state !== "active") n++
-    return n
-  }
+  // Theme palette accents with safe fallbacks.
+  property var palette: ({})
+  readonly property color okColor: palette.color2 || "#3FB950"
+  readonly property color warnColor: palette.color3 || Color.accent
+  readonly property color badColor: Color.urgent
 
-  Process {
-    id: stateProc
-    command: ["bash", root.pluginDir + "/hq-state.sh"]
-    stdout: StdioCollector {
-      onStreamFinished: {
-        try {
-          var d = JSON.parse(String(this.text))
-          root.windows = Math.max(0, Math.min(99, parseInt(d.windows) || 0))
-          root.services = Array.isArray(d.services) ? d.services.slice(0, 8) : []
-        } catch (e) {}
-      }
+  FileView {
+    id: paletteFile
+    path: Color.currentThemePath + "/colors.toml"
+    printErrors: false
+    onLoaded: {
+      var found = {}
+      var re = /^\s*([A-Za-z0-9_]+)\s*=\s*"(#[0-9A-Fa-f]{6,8})"/gm
+      var m
+      while ((m = re.exec(String(text()))) !== null) found[m[1]] = m[2]
+      root.palette = found
     }
   }
-  Timer {
-    interval: root.opened ? 1500 : 5000
-    running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: if (!stateProc.running) stateProc.running = true
-  }
-  Timer { id: refreshSoon; interval: 700; onTriggered: if (!stateProc.running) stateProc.running = true }
-
-  function run(cmd) { if (root.bar) root.bar.run(cmd); refreshSoon.restart() }
-  function openHq() { run("cornerstone-hq-open") }
-  function hideHq() { run("app-summon --hide '" + root.pattern + "'") }
-  function closeHq() { run("app-summon --close '" + root.pattern + "'") }
-  function restartAll() { run("systemctl --user restart kbp-server hq-bridge kbp-bot streambot lavalink") }
-  function restartOne(unit) {
-    if (/^[a-z0-9-]+$/.test(unit)) run("systemctl --user restart " + unit + ".service")
+  Connections {
+    target: Color
+    function onBackgroundChanged() { paletteFile.reload() }
+    function onAccentChanged() { paletteFile.reload() }
   }
 
-  IpcHandler {
-    id: ipc
-    target: root.ipcTarget
-    function toggle(): string { root.toggle(); return root.opened ? "open" : "closed" }
-    function show(): string { root.openHq(); return "summoned" }
-    function hide(): string { root.hideHq(); return "hidden" }
-    Component.onCompleted: IpcRegistry.register(ipc)
-    Component.onDestruction: IpcRegistry.unregister(ipc)
+  readonly property int windows: service ? service.windows : 0
+  readonly property var services: service ? service.services : []
+  readonly property int downCount: service ? service.downCount : 0
+  readonly property int upCount: service ? service.upCount : 0
+  readonly property int totalCount: service ? service.totalCount : 0
+
+  readonly property string barTooltip: {
+    var winLabel = windows > 0 ? "Open" : "Closed"
+    if (totalCount === 0) return "Cornerstone HQ · " + winLabel
+    return downCount === 0
+      ? "Cornerstone HQ · " + upCount + "/" + totalCount + " services up"
+      : "Cornerstone HQ · " + downCount + " service" + (downCount === 1 ? "" : "s") + " down"
+  }
+
+  // Flat list of keyboard-navigable stops: window actions, each service, restart all.
+  readonly property var stops: {
+    var list = [{ kind: "open" }]
+    if (windows > 0) { list.push({ kind: "hide" }); list.push({ kind: "close" }) }
+    for (var i = 0; i < services.length; i++)
+      list.push({ kind: "svc", unit: String(services[i].unit || "") })
+    list.push({ kind: "restartAll" })
+    return list
+  }
+
+  property int cursor: -1
+  property bool watching: false
+
+  onOpenedChanged: {
+    cursor = -1
+    if (service) {
+      if (opened && !watching) { watching = true; service.watchers++; service.refresh() }
+      else if (!opened && watching) { watching = false; service.watchers = Math.max(0, service.watchers - 1) }
+    }
+  }
+  Component.onDestruction: {
+    if (watching && service) service.watchers = Math.max(0, service.watchers - 1)
+  }
+
+  function isFocused(kind, unit) {
+    if (cursor < 0 || cursor >= stops.length) return false
+    var s = stops[cursor]
+    return s.kind === kind && (kind !== "svc" || s.unit === unit)
+  }
+
+  function focusOf(kind, unit) {
+    for (var i = 0; i < stops.length; i++)
+      if (stops[i].kind === kind && (kind !== "svc" || stops[i].unit === unit)) { cursor = i; return }
+  }
+
+  function activateStop(s) {
+    if (!s || !service) return
+    if (s.kind === "open") { service.openHq(); root.close() }
+    else if (s.kind === "hide") service.hideHq()
+    else if (s.kind === "close") service.closeHq()
+    else if (s.kind === "svc") service.restartOne(s.unit)
+    else if (s.kind === "restartAll") service.restartAll()
   }
 
   implicitWidth: button.implicitWidth
@@ -80,10 +109,10 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    tooltipText: ""
+    tooltipText: root.opened ? "" : root.barTooltip
     onPressed: function(code) {
-      if (code === Qt.RightButton) root.openHq()
-      else if (code === Qt.MiddleButton) root.hideHq()
+      if (code === Qt.RightButton && root.service) root.service.openHq()
+      else if (code === Qt.MiddleButton && root.service) root.service.hideHq()
       else root.toggle()
     }
     iconComponent: Component {
@@ -116,11 +145,16 @@ Panel {
     property string label: ""
     property color tint: root.foreground
     property real fill: 0.12
+    property bool focused: false
+    signal hovered()
     signal activated()
     width: parent ? parent.width : 0
     height: Style.space(30)
     radius: Style.space(6)
-    color: Qt.rgba(tint.r, tint.g, tint.b, rowArea.containsMouse ? fill + 0.08 : fill)
+    color: Qt.rgba(tint.r, tint.g, tint.b, rowArea.containsMouse || focused ? fill + 0.08 : fill)
+    border.width: focused ? 1 : 0
+    border.color: Color.accent
+    Behavior on color { ColorAnimation { duration: Style.duration(120) } }
     Text {
       anchors.verticalCenter: parent.verticalCenter
       anchors.left: parent.left
@@ -138,6 +172,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
+      onEntered: row.hovered()
       onClicked: row.activated()
     }
   }
@@ -158,9 +193,19 @@ Panel {
       implicitHeight: column.implicitHeight
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) {
+        if (dy === 0 || root.stops.length === 0) return
+        var n = root.stops.length
+        root.cursor = root.cursor < 0 ? (dy > 0 ? 0 : n - 1) : (root.cursor + dy + n) % n
+      }
+      onActivateRequested: {
+        if (root.cursor >= 0 && root.cursor < root.stops.length)
+          root.activateStop(root.stops[root.cursor])
+      }
       onTextKey: function(t) {
-        if (t === "o" || t === "O") { root.openHq(); root.close() }
-        else if (t === "h" || t === "H") root.hideHq()
+        if (!root.service) return
+        if (t === "o" || t === "O") { root.service.openHq(); root.close() }
+        else if (t === "h" || t === "H") root.service.hideHq()
       }
       clip: true
 
@@ -177,6 +222,7 @@ Panel {
             sourceSize.width: 72; sourceSize.height: 72
             fillMode: Image.PreserveAspectFit
             smooth: true
+            mipmap: true
             anchors.verticalCenter: parent.verticalCenter
           }
           Column {
@@ -210,17 +256,23 @@ Panel {
             label: root.windows > 0 ? "Bring HQ here" : "Open HQ"
             tint: root.warnColor
             fill: 0.22
-            onActivated: { root.openHq(); root.close() }
+            focused: root.isFocused("open", "")
+            onHovered: root.focusOf("open", "")
+            onActivated: { if (root.service) root.service.openHq(); root.close() }
           }
           ActionRow {
             visible: root.windows > 0
             label: "Hide HQ (keeps it running)"
-            onActivated: root.hideHq()
+            focused: root.isFocused("hide", "")
+            onHovered: root.focusOf("hide", "")
+            onActivated: if (root.service) root.service.hideHq()
           }
           ActionRow {
             visible: root.windows > 0
             label: "Close HQ window"
-            onActivated: root.closeHq()
+            focused: root.isFocused("close", "")
+            onHovered: root.focusOf("close", "")
+            onActivated: if (root.service) root.service.closeHq()
           }
         }
 
@@ -241,10 +293,16 @@ Panel {
             model: root.services
             Rectangle {
               required property var modelData
+              readonly property string unitName: String(modelData.unit || "")
+              readonly property bool focused: root.isFocused("svc", unitName)
               width: parent.width
               height: Style.space(26)
               radius: Style.space(6)
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, svcArea.containsMouse ? 0.14 : 0.06)
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b,
+                             svcArea.containsMouse || focused ? 0.14 : 0.06)
+              border.width: focused ? 1 : 0
+              border.color: Color.accent
+              Behavior on color { ColorAnimation { duration: Style.duration(120) } }
               Rectangle {
                 id: dot
                 width: 8; height: 8; radius: 4
@@ -269,7 +327,7 @@ Panel {
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(10)
                 textFormat: Text.PlainText
-                text: svcArea.containsMouse ? "restart" : String(modelData.state).slice(0, 20)
+                text: svcArea.containsMouse || focused ? "restart" : String(modelData.state).slice(0, 20)
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -279,7 +337,8 @@ Panel {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.restartOne(String(modelData.unit))
+                onEntered: root.focusOf("svc", unitName)
+                onClicked: if (root.service) root.service.restartOne(unitName)
               }
             }
           }
@@ -287,14 +346,16 @@ Panel {
 
         ActionRow {
           label: "Restart all HQ services"
-          onActivated: root.restartAll()
+          focused: root.isFocused("restartAll", "")
+          onHovered: root.focusOf("restartAll", "")
+          onActivated: if (root.service) root.service.restartAll()
         }
 
         Text {
           width: parent.width
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          text: "Right-click icon = open / bring back · middle-click = hide · o open · h hide"
+          text: "Right-click = open · middle-click = hide · j/k + Enter navigate · o open · h hide"
           color: root.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
